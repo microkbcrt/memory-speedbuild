@@ -1,5 +1,6 @@
 package io.github.doywvtkebrxvh.speedbuild;
 
+import io.papermc.paper.math.Position;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Difficulty;
@@ -7,6 +8,7 @@ import org.bukkit.GameMode;
 import org.bukkit.GameRule;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.World;
@@ -1648,30 +1650,60 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         }
     }
 
-    /** Creates or loads an editable template world. */
+    /**
+     * Creates or loads an editable source world.
+     *
+     * Paper 26.2 persists custom worlds as keyed dimensions. New worlds must be
+     * opened through their NamespacedKey rather than the obsolete name-only creator.
+     * A forced spawn prevents Paper from scanning an infinite void for a safe spawn.
+     */
     private World createVoidWorld(String worldName) {
         World current = Bukkit.getWorld(worldName);
         if (current != null) return current;
-        WorldCreator creator = new WorldCreator(worldName);
+
+        WorldCreator creator = WorldCreator.ofKey(NamespacedKey.minecraft(worldName));
         creator.generator(new VoidGenerator());
         creator.generateStructures(false);
+        creator.forcedSpawnPosition(Position.block(0, 65, 0), 0.0f, 0.0f);
+
         World world = Bukkit.createWorld(creator);
         if (world == null) throw new IllegalArgumentException("创建世界失败：" + worldName);
+        ensureVoidSpawnPlatform(world);
         configureIsolatedWorld(world);
         return world;
     }
 
-    /** Loads a copied runtime world. Its on-disk folder must already exist. */
+    /**
+     * Loads the copied runtime dimension. The forced spawn is essential for a
+     * void generator: without it Paper's vanilla spawn finder may synchronously
+     * scan and generate empty chunks indefinitely while Bukkit.createWorld runs.
+     */
     private World loadPlayWorld(Arena arena) {
         World current = arena.world();
         if (current != null) return current;
-        WorldCreator creator = new WorldCreator(arena.playWorldName());
+
+        WorldCreator creator = WorldCreator.ofKey(NamespacedKey.minecraft(arena.playWorldName()));
         creator.generator(new VoidGenerator());
         creator.generateStructures(false);
+        creator.forcedSpawnPosition(Position.block(0, 65, 0), 0.0f, 0.0f);
+
         World world = Bukkit.createWorld(creator);
         if (world == null) throw new IllegalArgumentException("无法加载运行地图：" + arena.playWorldName());
+        ensureVoidSpawnPlatform(world);
         configureIsolatedWorld(world);
         return world;
+    }
+
+    /** Keeps every newly created / copied void dimension safe even before an admin builds in it. */
+    private void ensureVoidSpawnPlatform(World world) {
+        for (int x = -1; x <= 1; x++) {
+            for (int z = -1; z <= 1; z++) {
+                if (world.getBlockAt(x, 64, z).getType().isAir()) {
+                    world.getBlockAt(x, 64, z).setType(Material.SMOOTH_QUARTZ, false);
+                }
+            }
+        }
+        world.setSpawnLocation(new Location(world, 0.5, 65.0, 0.5));
     }
 
     private void configureIsolatedWorld(World world) {
@@ -1732,14 +1764,18 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         World source = requireTemplateWorld(arena);
         source.save();
         Path sourceFolder = source.getWorldFolder().toPath();
-        Path targetFolder = Bukkit.getWorldContainer().toPath().resolve(arena.playWorldName());
+        // In Paper 26.2 a custom world is a dimension folder, normally:
+        // <primary-level>/dimensions/minecraft/<world-key>. The play world must be
+        // a sibling of the source dimension, not <world-container>/<play-name>.
+        Path targetFolder = sourceFolder.resolveSibling(arena.playWorldName());
         Path stagingFolder = targetFolder.resolveSibling(arena.playWorldName() + ".sb-copying");
 
         try {
             deleteDirectory(stagingFolder);
             copyWorldDirectory(sourceFolder, stagingFolder);
             // Only replace the old clone after its fresh replacement has copied successfully.
-            discardPlayWorld(arena);
+            discardPlayWorld(arena, targetFolder);
+            deleteLegacyRootClone(arena, targetFolder);
             moveDirectory(stagingFolder, targetFolder);
             World play = loadPlayWorld(arena);
             play.setGameRule(GameRule.KEEP_INVENTORY, true);
@@ -1756,10 +1792,17 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
 
     /** Deletes only the disposable <map>_play world, never the editable source. */
     private void discardPlayWorld(Arena arena) {
+        discardPlayWorld(arena, runtimeWorldFolder(arena));
+    }
+
+    /**
+     * Unloads and deletes the current runtime dimension. targetFolder is supplied
+     * by rebuildPlayWorld so deletion always uses the same 26.2 dimension layout
+     * that was used to copy it.
+     */
+    private void discardPlayWorld(Arena arena, Path targetFolder) {
         World play = arena.world();
-        Path folder = play != null
-                ? play.getWorldFolder().toPath()
-                : Bukkit.getWorldContainer().toPath().resolve(arena.playWorldName());
+        Path folder = play != null ? play.getWorldFolder().toPath() : targetFolder;
         removeJudge(arena);
         if (play != null) {
             for (Player player : new ArrayList<>(play.getPlayers())) {
@@ -1774,6 +1817,25 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         } catch (IOException ex) {
             throw new IllegalArgumentException("无法删除旧运行地图 " + arena.playWorldName() + "：" + ex.getMessage(), ex);
         }
+    }
+
+    /** Resolves the disposable dimension folder from the editable source's actual layout. */
+    private Path runtimeWorldFolder(Arena arena) {
+        World source = arena.templateWorld();
+        if (source != null) return source.getWorldFolder().toPath().resolveSibling(arena.playWorldName());
+
+        // Fallback for a partially configured arena: Paper 26.2's modern keyed
+        // dimension layout. It is only used when the source was unexpectedly absent.
+        return Bukkit.getWorldContainer().toPath()
+                .resolve("dimensions")
+                .resolve("minecraft")
+                .resolve(arena.playWorldName());
+    }
+
+    /** Removes only stale folders created by the older root-folder clone implementation. */
+    private void deleteLegacyRootClone(Arena arena, Path correctTarget) throws IOException {
+        Path legacy = Bukkit.getWorldContainer().toPath().resolve(arena.playWorldName());
+        if (!legacy.equals(correctTarget)) deleteDirectory(legacy);
     }
 
     private void restorePlayWorldAfterMatch(Arena arena) {
@@ -1812,16 +1874,19 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     }
 
     /**
-     * Paper's world-scoped runtime metadata contains the source world's identity. It must not be
-     * copied into <map>_play. The check also handles modern nested dimension folders such as
-     * dimensions/minecraft/<world>/data/paper/metadata.dat.
+     * Paper's metadata.dat records the source dimension identity. Do not copy it
+     * into <map>_play, including modern paths such as
+     * dimensions/minecraft/<world>/data/paper/metadata.dat. Other files are kept.
      */
     private boolean skipWorldCopyPath(Path relative) {
         if (relative.getNameCount() == 0) return false;
         String normalized = relative.toString().replace(File.separatorChar, '/');
         String fileName = relative.getFileName().toString();
         if (fileName.equals("uid.dat") || fileName.equals("session.lock")) return true;
-        if (normalized.equals("data/paper") || normalized.startsWith("data/paper/") || normalized.contains("/data/paper/")) return true;
+        if (fileName.equals("metadata.dat")
+                && (normalized.equals("data/paper/metadata.dat") || normalized.contains("/data/paper/metadata.dat"))) {
+            return true;
+        }
         // These belong to players, not to an arena template, and must not travel into a game clone.
         return normalized.equals("playerdata") || normalized.startsWith("playerdata/")
                 || normalized.equals("stats") || normalized.startsWith("stats/")
