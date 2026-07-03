@@ -27,6 +27,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockDamageEvent;
 import org.bukkit.event.block.BlockExplodeEvent;
 import org.bukkit.event.block.BlockPistonExtendEvent;
 import org.bukkit.event.block.BlockPistonRetractEvent;
@@ -551,8 +552,22 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     }
 
     private void handleEdit(Player player, String[] args) {
+        // /sb edit template <名称>：进入独立模板世界，便于管理员在虚空平台上搭建标准建筑。
+        if (args.length == 3 && args[1].equalsIgnoreCase("template")) {
+            String key = validKey(args[2], "模板名称");
+            if (!templates.contains(key)) throw new IllegalArgumentException("模板地图不存在：" + key + "。请先使用 /sb create template " + key);
+            World world = Bukkit.getWorld(templateWorldName(key));
+            if (world == null) world = createVoidWorld(templateWorldName(key));
+            player.teleport(world.getSpawnLocation());
+            player.setGameMode(GameMode.CREATIVE);
+            disableFlight(player);
+            send(player, ChatColor.GREEN + "已进入模板编辑模式：" + key + "。完成后使用 /sb save template " + key + " 保存，/sb leave template 或 /sb quit 返回生存主世界。");
+            return;
+        }
+
+        // /sb edit <竞技场名称>：进入可编辑的原始竞技场地图；绝不进入 *_play 运行图。
         if (args.length != 2) {
-            returnUsage(player, "/sb edit <地图名称>");
+            returnUsage(player, "/sb edit <地图名称> 或 /sb edit template <模板名称>");
             return;
         }
         Arena arena = requireArena(validKey(args[1], "地图名称"));
@@ -569,7 +584,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         sender.sendMessage(ChatColor.WHITE + "/sb join <地图>" + ChatColor.GRAY + "、/sb quit");
         if (sender.hasPermission(ADMIN_PERMISSION)) {
             sender.sendMessage(ChatColor.WHITE + "/sb set survival");
-            sender.sendMessage(ChatColor.WHITE + "/sb create template <名称>" + ChatColor.GRAY + "、/sb save template <名称>" + ChatColor.GRAY + "、/sb leave template");
+            sender.sendMessage(ChatColor.WHITE + "/sb create template <名称>" + ChatColor.GRAY + "、/sb edit template <名称>" + ChatColor.GRAY + "、/sb save template <名称>" + ChatColor.GRAY + "、/sb leave template");
             sender.sendMessage(ChatColor.WHITE + "/sb create map <名称>" + ChatColor.GRAY + "、/sb edit <名称>" + ChatColor.GRAY + "、/sb save <名称>");
             sender.sendMessage(ChatColor.WHITE + "/sb addbuild ... <名称> <1|2|3>" + ChatColor.GRAY + "、/sb delbuild <名称>" + ChatColor.GRAY + "、/sb listbuild");
             sender.sendMessage(ChatColor.WHITE + "/sb add setspawn <1-8>" + ChatColor.GRAY + "、/sb addisland <x1> <z1> <x2> <z2> <1-8>");
@@ -1445,6 +1460,23 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         if (!canModify(arena, event.getPlayer(), event.getBlockPlaced().getX(), event.getBlockPlaced().getZ())) event.setCancelled(true);
     }
 
+    /**
+     * Haste alone still goes through vanilla hardness/tool checks, so blocks such
+     * as iron blocks and obsidian remain slow. During RESTORE, tell the server to
+     * break the first damaged block instantly. The normal BlockBreakEvent then
+     * runs immediately and the per-tick material reconciler restores the item if
+     * vanilla did not drop it because the held tool was unsuitable.
+     */
+    @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
+    public void onBlockDamage(BlockDamageEvent event) {
+        Player player = event.getPlayer();
+        Arena arena = arenaOf(player.getUniqueId());
+        if (arena == null) return;
+        Block block = event.getBlock();
+        if (!canModify(arena, player, block.getX(), block.getZ())) return;
+        if (!block.getType().isAir()) event.setInstaBreak(true);
+    }
+
     @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
     public void onBlockBreak(BlockBreakEvent event) {
         Arena arena = arenaOf(event.getPlayer().getUniqueId());
@@ -1564,6 +1596,8 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
 
     private boolean canModify(Arena arena, Player player, int x, int z) {
         if (arena.phase != Phase.RESTORE) return false;
+        World runtime = arena.world();
+        if (runtime == null || player.getWorld() != runtime) return false;
         PlayerState state = arena.players.get(player.getUniqueId());
         if (state == null || !state.alive || state.completed) return false;
         Bounds2D bounds = arena.islands.get(state.slot);
@@ -2213,7 +2247,13 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         }
         String root = args[0].toLowerCase(Locale.ROOT);
         if (root.equals("join") && args.length == 2) return filter(args[1], arenas.values().stream().filter(arena -> arena.registered).map(arena -> arena.name).toList());
-        if ((root.equals("register") || root.equals("unregister") || root.equals("edit")) && args.length == 2) return filter(args[1], new ArrayList<>(arenas.keySet()));
+        if ((root.equals("register") || root.equals("unregister")) && args.length == 2) return filter(args[1], new ArrayList<>(arenas.keySet()));
+        if (root.equals("edit") && args.length == 2) {
+            List<String> choices = new ArrayList<>(arenas.keySet());
+            choices.add("template");
+            return filter(args[1], choices);
+        }
+        if (root.equals("edit") && args.length == 3 && args[1].equalsIgnoreCase("template")) return filter(args[2], new ArrayList<>(templates));
         if (root.equals("create") && args.length == 2) return filter(args[1], List.of("template", "map"));
         if (root.equals("set") && args.length == 2) return filter(args[1], List.of("survival"));
         if (root.equals("leave") && args.length == 2) return filter(args[1], List.of("template"));
