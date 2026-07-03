@@ -2,6 +2,7 @@ package io.github.doywvtkebrxvh.speedbuild;
 
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
+import org.bukkit.Difficulty;
 import org.bukkit.GameMode;
 import org.bukkit.GameRule;
 import org.bukkit.Location;
@@ -50,7 +51,6 @@ import org.bukkit.configuration.file.YamlConfiguration;
 
 import java.io.File;
 import java.io.IOException;
-import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -348,8 +348,6 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         int x2 = Integer.parseInt(args[4]);
         int y2 = Integer.parseInt(args[5]);
         int z2 = Integer.parseInt(args[6]);
-        // 建筑显示名称允许中文；内部键会做 Unicode NFC 规范化和英文大小写折叠，
-        // 所以“我的小屋”可直接用于 addbuild / delbuild / 侧边栏主题显示。
         String name = validBuildName(args[7]);
         String key = buildKey(name);
         int difficulty = Integer.parseInt(args[8]);
@@ -374,7 +372,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         send(player, ChatColor.GREEN + "已保存建筑 " + ChatColor.AQUA + build.name + ChatColor.GREEN + "，难度 " + difficulty + "，高度 " + build.height + "，方块数 " + build.blocks.size() + "。");
     }
 
-    private BuildData captureBuild(World world, String name, int difficulty, int minX, int minY, int minZ, int maxY) {
+    private BuildData captureBuild(World world, String key, int difficulty, int minX, int minY, int minZ, int maxY) {
         List<BlockSnapshot> snapshots = new ArrayList<>();
         Set<Material> unsupported = new LinkedHashSet<>();
         for (int y = minY; y <= maxY; y++) {
@@ -393,7 +391,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         if (!unsupported.isEmpty()) {
             throw new IllegalArgumentException("选区包含不能直接以同种物品发放的方块：" + unsupported + "。请使用普通可放置方块。");
         }
-        return new BuildData(name, difficulty, maxY - minY + 1, snapshots);
+        return new BuildData(key, difficulty, maxY - minY + 1, snapshots);
     }
 
     private void handleDelBuild(CommandSender sender, String[] args) {
@@ -401,10 +399,10 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             usage(sender, "/sb delbuild <name>");
             return;
         }
-        String requestedName = validBuildName(args[1]);
-        String key = buildKey(requestedName);
+        String name = validBuildName(args[1]);
+        String key = buildKey(name);
         BuildData removed = builds.remove(key);
-        if (removed == null) throw new IllegalArgumentException("不存在名为 " + requestedName + " 的建筑。");
+        if (removed == null) throw new IllegalArgumentException("不存在名为 " + name + " 的建筑。");
         saveState();
         send(sender, ChatColor.GREEN + "已删除建筑 " + removed.name + "。");
     }
@@ -668,6 +666,9 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             return;
         }
         World world = requireWorld(arena);
+        // Peaceful difficulty removes hostile mobs, including an elder guardian.
+        // The judge is a visual hostile entity, so use NORMAL during a match.
+        world.setDifficulty(Difficulty.NORMAL);
         world.setGameRule(GameRule.KEEP_INVENTORY, false);
         arena.phase = Phase.MEMORY;
         arena.round = 1;
@@ -692,14 +693,19 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         arena.currentBuild = randomBuild();
         for (PlayerState state : activeStates(arena)) {
             Player player = Bukkit.getPlayer(state.uuid);
-            clearTargetArea(arena, state.slot);
-            pasteBuild(arena, state.slot, arena.currentBuild);
-            state.completed = false;
+            // Move first: the source template may occupy the old centre location.
             if (player != null && player.isOnline()) {
                 clearInventory(player);
                 player.setGameMode(GameMode.SURVIVAL);
                 enableFlight(player);
-                player.removePotionEffect(PotionEffectType.GLOWING);
+                clearJudgeCurse(player);
+                player.removePotionEffect(PotionEffectType.HASTE);
+                moveToMemoryStaging(arena, state, player);
+            }
+            clearTargetArea(arena, state.slot);
+            pasteBuild(arena, state.slot, arena.currentBuild);
+            state.completed = false;
+            if (player != null && player.isOnline()) {
                 title(player, ChatColor.AQUA + "记忆阶段", ChatColor.WHITE + arena.currentBuild.name, 35);
             }
         }
@@ -719,6 +725,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
                 giveMaterials(player, arena.currentBuild);
                 player.setGameMode(GameMode.SURVIVAL);
                 enableFlight(player);
+                applyRestoreEffects(player);
                 title(player, ChatColor.GREEN + "复原阶段", ChatColor.WHITE + "开始搭建！", 25);
             }
         }
@@ -735,6 +742,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             title(player, ChatColor.GOLD + "完美复原！", "", 40);
             player.playSound(player.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
             player.setGameMode(GameMode.ADVENTURE);
+            player.removePotionEffect(PotionEffectType.HASTE);
             disableFlight(player);
         }
         broadcast(arena, ChatColor.YELLOW + state.name + " 在 " + spent + " 秒内还原了建筑！");
@@ -779,6 +787,8 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             if (player != null && player.isOnline()) {
                 player.setGameMode(GameMode.SURVIVAL);
                 enableFlight(player);
+                player.removePotionEffect(PotionEffectType.HASTE);
+                clearJudgeCurse(player);
                 title(player, ChatColor.RED + "TIME'S UP! 时间到!", "", 40);
             }
         }
@@ -796,10 +806,21 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         later(arena, session, 40L, () -> {
             for (PlayerState state : active) {
                 Player player = Bukkit.getPlayer(state.uuid);
-                if (player != null && player.isOnline()) {
-                    player.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 140, 0, false, false, false));
-                    title(player, ChatColor.AQUA + "审视者正在做出鉴定", "", 60);
+                if (player == null || !player.isOnline()) continue;
+
+                // Sends the client-side elder guardian apparition directly.
+                // This does not depend on the spawned judge's AI or distance.
+                try {
+                    player.showElderGuardian(false);
+                } catch (Throwable ex) {
+                    getLogger().log(Level.WARNING, "无法向 " + player.getName() + " 发送远古守卫者鬼影效果。", ex);
                 }
+
+                // Vanilla-like curse for the short judging sequence.
+                player.addPotionEffect(new PotionEffect(
+                        PotionEffectType.MINING_FATIGUE, 140, 2, false, false, false
+                ), true);
+                title(player, ChatColor.AQUA + "审视者正在做出鉴定", "", 60);
             }
         });
         later(arena, session, 100L, () -> {
@@ -824,6 +845,10 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
 
     private void finishJudgedElimination(Arena arena, PlayerState loser) {
         removeJudge(arena);
+        for (PlayerState state : arena.players.values()) {
+            Player online = Bukkit.getPlayer(state.uuid);
+            if (online != null && online.isOnline()) clearJudgeCurse(online);
+        }
         clearWholeIsland(arena, loser.slot);
         arena.judgedLoser = null;
         Player player = Bukkit.getPlayer(loser.uuid);
@@ -938,13 +963,22 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         Point point = arena.deathSpawn != null ? arena.deathSpawn : arena.centrePoint;
         if (point != null) player.teleport(point.toLocation(world));
         clearInventory(player);
+        player.removePotionEffect(PotionEffectType.HASTE);
+        clearJudgeCurse(player);
         player.setGameMode(GameMode.SPECTATOR);
         disableFlight(player);
     }
 
+    /** Removes effects applied only by the judging presentation. */
+    private void clearJudgeCurse(Player player) {
+        player.removePotionEffect(PotionEffectType.GLOWING); // cleanup for older plugin builds
+        player.removePotionEffect(PotionEffectType.MINING_FATIGUE);
+    }
+
     private void returnToSurvival(Player player, boolean clear) {
         if (clear) clearInventory(player);
-        player.removePotionEffect(PotionEffectType.GLOWING);
+        clearJudgeCurse(player);
+        player.removePotionEffect(PotionEffectType.HASTE);
         if (Bukkit.getScoreboardManager() != null) player.setScoreboard(Bukkit.getScoreboardManager().getMainScoreboard());
         player.setGameMode(GameMode.SURVIVAL);
         disableFlight(player);
@@ -978,7 +1012,11 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
                     Player player = Bukkit.getPlayer(state.uuid);
                     if (player != null && player.isOnline()) {
                         enforceIslandBounds(arena, state, player, null);
-                        if (!state.completed && matchesBuild(arena, state.slot, arena.currentBuild)) playerCompleted(arena, state);
+                        if (!state.completed) {
+                            applyRestoreEffects(player);
+                            replenishRestoreMaterials(arena, state, player, arena.currentBuild);
+                            if (matchesBuild(arena, state.slot, arena.currentBuild)) playerCompleted(arena, state);
+                        }
                     }
                 }
             } else if (arena.phase == Phase.JUDGING) {
@@ -1173,61 +1211,191 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         return new MatchResult(value, perfect);
     }
 
-    private void giveMaterials(Player player, BuildData build) {
+    /** Keep players outside the 7×7 build footprint before a memory build is pasted. */
+    private void moveToMemoryStaging(Arena arena, PlayerState state, Player player) {
+        Anchor anchor = arena.anchors.get(state.slot);
+        Bounds2D bounds = arena.islands.get(state.slot);
+        if (anchor == null || bounds == null) return;
+        World world = requireWorld(arena);
+        int[][] offsets = {{5, 0}, {-5, 0}, {0, 5}, {0, -5}, {5, 5}, {5, -5}, {-5, 5}, {-5, -5}};
+        for (int[] offset : offsets) {
+            int x = anchor.x + offset[0];
+            int z = anchor.z + offset[1];
+            if (!containsThreeByThree(bounds, x, z)) continue;
+            createPlatform(world, x, anchor.y, z);
+            player.teleport(new Location(world, x + 0.5, anchor.y + 1.0, z + 0.5, player.getLocation().getYaw(), player.getLocation().getPitch()));
+            return;
+        }
+        // A malformed/tiny island has no area outside its 7×7 footprint. Keep
+        // the player above the build rather than inside the newly pasted blocks.
+        player.teleport(new Location(world, anchor.x + 0.5, anchor.y + Math.max(5.0, arena.currentBuild.height + 3.0), anchor.z + 0.5,
+                player.getLocation().getYaw(), player.getLocation().getPitch()));
+        getLogger().warning("竞技场 " + arena.name + " 的玩家 " + state.slot + " 岛屿没有 7×7 外的安全等候区；已将玩家传送到建筑上方。建议扩大岛屿边界。");
+    }
+
+    private static boolean containsThreeByThree(Bounds2D bounds, int centerX, int centerZ) {
+        return bounds.contains(centerX - 1, centerZ - 1) && bounds.contains(centerX + 1, centerZ + 1);
+    }
+
+    /** Haste 255 is intentionally refreshed during RESTORE for immediate correction breaks. */
+    private void applyRestoreEffects(Player player) {
+        player.addPotionEffect(new PotionEffect(PotionEffectType.HASTE, 40, 255, true, false, false), true);
+    }
+
+    /**
+     * For every template material, keep: placed blocks in this island's 7×7
+     * vertical column + items carried by the player == template amount.
+     * Deficits are restored immediately; surplus carried template items are
+     * removed to prevent material duplication.
+     */
+    private void replenishRestoreMaterials(Arena arena, PlayerState state, Player player, BuildData build) {
+        if (build == null) return;
+        Map<Material, Integer> required = requiredMaterials(build);
+        Map<Material, Integer> placed = placedMaterials(arena, state.slot, build, required.keySet());
+        for (Map.Entry<Material, Integer> entry : required.entrySet()) {
+            Material material = entry.getKey();
+            int expected = entry.getValue();
+            int total = placed.getOrDefault(material, 0) + countInventoryMaterial(player, material);
+            if (total < expected) {
+                giveMaterial(player, material, expected - total);
+            } else if (total > expected) {
+                removeInventoryMaterial(player, material, total - expected);
+            }
+        }
+    }
+
+    private Map<Material, Integer> requiredMaterials(BuildData build) {
         Map<Material, Integer> required = new LinkedHashMap<>();
         for (BlockSnapshot snapshot : build.blocks) {
             Material material = Bukkit.createBlockData(snapshot.blockData).getMaterial();
             required.merge(material, 1, Integer::sum);
         }
-        for (Map.Entry<Material, Integer> entry : required.entrySet()) {
-            int remaining = entry.getValue();
-            while (remaining > 0) {
-                int stack = Math.min(remaining, entry.getKey().getMaxStackSize());
-                Map<Integer, ItemStack> leftover = player.getInventory().addItem(new ItemStack(entry.getKey(), stack));
-                for (ItemStack item : leftover.values()) {
-                    player.getWorld().dropItemNaturally(player.getLocation(), item);
+        return required;
+    }
+
+    private Map<Material, Integer> placedMaterials(Arena arena, int slot, BuildData build, Set<Material> tracked) {
+        Map<Material, Integer> result = new HashMap<>();
+        Anchor anchor = arena.anchors.get(slot);
+        if (anchor == null) return result;
+        World world = requireWorld(arena);
+        int fromY = Math.max(world.getMinHeight(), anchor.y + 1);
+        int toY = Math.min(world.getMaxHeight(), fromY + Math.max(1, build.height));
+        for (int y = fromY; y < toY; y++) {
+            for (int x = anchor.x - BUILD_RADIUS; x <= anchor.x + BUILD_RADIUS; x++) {
+                for (int z = anchor.z - BUILD_RADIUS; z <= anchor.z + BUILD_RADIUS; z++) {
+                    Material type = world.getBlockAt(x, y, z).getType();
+                    if (tracked.contains(type)) result.merge(type, 1, Integer::sum);
                 }
-                remaining -= stack;
             }
+        }
+        return result;
+    }
+
+    private int countInventoryMaterial(Player player, Material material) {
+        int count = 0;
+        for (ItemStack stack : player.getInventory().getStorageContents()) {
+            if (stack != null && stack.getType() == material) count += stack.getAmount();
+        }
+        ItemStack offhand = player.getInventory().getItemInOffHand();
+        if (offhand != null && offhand.getType() == material) count += offhand.getAmount();
+        return count;
+    }
+
+    private void removeInventoryMaterial(Player player, Material material, int amount) {
+        for (int slot = 0; slot < player.getInventory().getStorageContents().length && amount > 0; slot++) {
+            ItemStack stack = player.getInventory().getItem(slot);
+            if (stack == null || stack.getType() != material) continue;
+            int taken = Math.min(amount, stack.getAmount());
+            stack.setAmount(stack.getAmount() - taken);
+            if (stack.getAmount() <= 0) player.getInventory().setItem(slot, null);
+            amount -= taken;
+        }
+        ItemStack offhand = player.getInventory().getItemInOffHand();
+        if (amount > 0 && offhand != null && offhand.getType() == material) {
+            int taken = Math.min(amount, offhand.getAmount());
+            offhand.setAmount(offhand.getAmount() - taken);
+            player.getInventory().setItemInOffHand(offhand.getAmount() <= 0 ? null : offhand);
         }
     }
 
-    private void spawnJudge(Arena arena, BuildData build) {
+    private void giveMaterial(Player player, Material material, int amount) {
+        while (amount > 0) {
+            int stackSize = Math.min(amount, material.getMaxStackSize());
+            Map<Integer, ItemStack> leftover = player.getInventory().addItem(new ItemStack(material, stackSize));
+            if (!leftover.isEmpty()) {
+                // The 7×7 speed-build format normally fits in inventory. Do not
+                // silently drop items into a void if an oversized template does not.
+                getLogger().warning("玩家 " + player.getName() + " 背包没有空间补充 " + material + "；请降低模板材料总量。");
+                return;
+            }
+            amount -= stackSize;
+        }
+    }
+
+    private void giveMaterials(Player player, BuildData build) {
+        for (Map.Entry<Material, Integer> entry : requiredMaterials(build).entrySet()) {
+            giveMaterial(player, entry.getKey(), entry.getValue());
+        }
+    }
+
+    /**
+     * Spawns the visual judge only. A spawn failure must never interrupt the
+     * judging state machine, otherwise the arena would be left in JUDGING.
+     */
+    private boolean spawnJudge(Arena arena, BuildData build) {
         removeJudge(arena);
-        if (arena.centreAnchor == null) return;
-        World world = requireWorld(arena);
-        Anchor anchor = arena.centreAnchor;
-        Location at = new Location(world, anchor.x + 0.5, anchor.y + build.height + 2.0, anchor.z + 0.5);
-        Entity entity = world.spawnEntity(at, org.bukkit.entity.EntityType.ELDER_GUARDIAN);
-        if (entity instanceof Guardian guardian) {
+        if (arena.centreAnchor == null || build == null) return false;
+        try {
+            World world = requireWorld(arena);
+            // A peaceful world may remove a manually spawned elder guardian at once.
+            if (world.getDifficulty() == Difficulty.PEACEFUL) world.setDifficulty(Difficulty.NORMAL);
+            Anchor anchor = arena.centreAnchor;
+            double y = Math.min(world.getMaxHeight() - 2.0, anchor.y + build.height + 2.0);
+            Location at = new Location(world, anchor.x + 0.5, Math.max(world.getMinHeight() + 1.0, y), anchor.z + 0.5);
+            // In a void world the centre chunk may not have been loaded yet.
+            at.getChunk().load(true);
+            Entity entity = world.spawnEntity(at, org.bukkit.entity.EntityType.ELDER_GUARDIAN);
+            if (!(entity instanceof Guardian guardian)) {
+                if (entity != null) entity.remove();
+                getLogger().warning("审视者实体生成返回了非远古守卫者实体；将跳过实体展示，但评判会继续。");
+                return false;
+            }
             guardian.setCustomName(ChatColor.AQUA + "审视者");
             guardian.setCustomNameVisible(true);
             guardian.setAI(false);
             guardian.setInvulnerable(true);
             guardian.setSilent(true);
             guardian.setGravity(false);
+            guardian.setRemoveWhenFarAway(false);
             arena.judge = guardian.getUniqueId();
-        } else {
-            entity.remove();
+            return true;
+        } catch (Throwable ex) {
+            // Entity registry/spawn restrictions must not be able to freeze a match.
+            getLogger().log(Level.WARNING, "无法生成审视者；将继续执行评判流程。", ex);
+            arena.judge = null;
+            return false;
         }
     }
 
     private void drawJudgeBeam(Arena arena, int slot, int session) {
-        if (arena.judge == null) return;
-        Entity entity = Bukkit.getEntity(arena.judge);
         Anchor target = arena.anchors.get(slot);
-        if (entity == null || target == null) return;
-        Location start = entity.getLocation().add(0.0, 1.0, 0.0);
+        if (target == null) return;
+        Entity entity = arena.judge == null ? null : Bukkit.getEntity(arena.judge);
+        Location start = entity == null
+                ? new Location(requireWorld(arena), arena.centreAnchor.x + 0.5, arena.centreAnchor.y + 3.0, arena.centreAnchor.z + 0.5)
+                : entity.getLocation().add(0.0, 1.0, 0.0);
         Location end = new Location(requireWorld(arena), target.x + 0.5, target.y + 1.0, target.z + 0.5);
         for (int repeat = 0; repeat < 6; repeat++) {
             int delay = repeat * 8;
             later(arena, session, delay, () -> {
-                Entity current = Bukkit.getEntity(arena.judge);
-                if (current == null) return;
+                World world = start.getWorld();
+                if (world == null) return;
                 for (int i = 0; i <= 30; i++) {
                     double progress = i / 30.0;
-                    Location point = start.clone().multiply(1.0 - progress).add(end.clone().multiply(progress));
-                    start.getWorld().spawnParticle(Particle.END_ROD, point, 1, 0, 0, 0, 0);
+                    double x = start.getX() + (end.getX() - start.getX()) * progress;
+                    double y = start.getY() + (end.getY() - start.getY()) * progress;
+                    double z = start.getZ() + (end.getZ() - start.getZ()) * progress;
+                    world.spawnParticle(Particle.END_ROD, x, y, z, 1, 0, 0, 0, 0);
                 }
             });
         }
@@ -1416,7 +1584,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         Collections.reverse(reverse);
         for (String name : reverse) {
             if (result.size() >= 3) break;
-            result.add(ChatColor.YELLOW.toString() + (result.size() + 1) + ". " + ChatColor.WHITE + name);
+            result.add(ChatColor.YELLOW + (result.size() + 1) + ". " + ChatColor.WHITE + name);
         }
         return result;
     }
@@ -1468,6 +1636,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         world.setGameRule(GameRule.DO_MOB_SPAWNING, false);
         world.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, false);
         world.setGameRule(GameRule.DO_WEATHER_CYCLE, false);
+        world.setDifficulty(Difficulty.NORMAL);
         world.setTime(6000L);
         world.setStorm(false);
         world.setGameRule(GameRule.KEEP_INVENTORY, true);
@@ -1543,36 +1712,24 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         return value;
     }
 
-    /**
-     * 仅用于地图/模板的内部世界键。世界目录名保持 ASCII，避免不同文件系统与服务端工具
-     * 对 Unicode 世界名的兼容性问题。
-     */
+    private static String validBuildName(String raw) {
+        String name = raw.trim();
+        if (!name.matches("[\\p{IsHan}a-zA-Z0-9_-]{1,32}")) {
+            throw new IllegalArgumentException("建筑名称只能使用 1-32 个中文、字母、数字、下划线或连字符，且不能包含空格。");
+        }
+        return name;
+    }
+
+    private static String buildKey(String name) {
+        return name.toLowerCase(Locale.ROOT);
+    }
+
     private static String validKey(String raw, String label) {
         String key = raw.toLowerCase(Locale.ROOT);
         if (!key.matches("[a-z0-9_-]{1,32}")) {
             throw new IllegalArgumentException(label + "只能使用 1-32 个小写字母、数字、下划线或连字符。");
         }
         return key;
-    }
-
-    /**
-     * 建筑名称是面对玩家展示的主题名，允许中文。命令参数本身不含空格，因此名称也不允许空格。
-     * NFC 规范化避免同一中文/拉丁组合字符出现多个看似相同但实际不同的名称。
-     */
-    private static String validBuildName(String raw) {
-        String name = Normalizer.normalize(raw, Normalizer.Form.NFC).trim();
-        int length = name.codePointCount(0, name.length());
-        if (length < 1 || length > 32 || !name.matches("[\\p{IsHan}\\p{IsLatin}\\p{Nd}_-]+")) {
-            throw new IllegalArgumentException("建筑名称只能使用 1-32 个中文、字母、数字、下划线或连字符，且不能包含空格。");
-        }
-        return name;
-    }
-
-    /**
-     * 内部匹配键：中文保持原样，英文字母不区分大小写。
-     */
-    private static String buildKey(String name) {
-        return Normalizer.normalize(name, Normalizer.Form.NFC).toLowerCase(Locale.ROOT);
     }
 
     private static String templateWorldName(String key) {
@@ -1679,18 +1836,8 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
                     } catch (NumberFormatException ignored) { }
                 }
                 if (!snapshots.isEmpty()) {
-                    String storedName = section.getString("name", key);
-                    try {
-                        String displayName = validBuildName(storedName);
-                        String canonicalKey = buildKey(displayName);
-                        if (builds.containsKey(canonicalKey)) {
-                            getLogger().warning("state.yml 中存在重复建筑名称，已跳过后面的条目：" + displayName);
-                            continue;
-                        }
-                        builds.put(canonicalKey, new BuildData(displayName, section.getInt("difficulty", 1), section.getInt("height", 1), snapshots));
-                    } catch (IllegalArgumentException ex) {
-                        getLogger().warning("state.yml 中建筑名称无效，已跳过：" + storedName);
-                    }
+                    BuildData build = new BuildData(section.getString("name", key), section.getInt("difficulty", 1), section.getInt("height", 1), snapshots);
+                    builds.put(buildKey(build.name), build);
                 }
             }
         }
@@ -1801,9 +1948,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             return filter(args[1], choices);
         }
         if (root.equals("save") && args.length == 3 && args[1].equalsIgnoreCase("template")) return filter(args[2], new ArrayList<>(templates));
-        if (root.equals("delbuild") && args.length == 2) {
-            return filter(args[1], builds.values().stream().map(build -> build.name).toList());
-        }
+        if ((root.equals("delbuild")) && args.length == 2) return filter(args[1], builds.values().stream().map(build -> build.name).toList());
         if (root.equals("add") && args.length == 2) return filter(args[1], List.of("setspawn", "centre", "deathspawn"));
         if (root.equals("del") && args.length == 2) return filter(args[1], List.of("setspawn"));
         return List.of();
