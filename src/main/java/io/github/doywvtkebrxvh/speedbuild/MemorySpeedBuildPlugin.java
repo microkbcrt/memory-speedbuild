@@ -1584,7 +1584,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         Collections.reverse(reverse);
         for (String name : reverse) {
             if (result.size() >= 3) break;
-            result.add(ChatColor.YELLOW + (result.size() + 1) + ". " + ChatColor.WHITE + name);
+            result.add(ChatColor.YELLOW.toString() + (result.size() + 1) + ". " + ChatColor.WHITE + name);
         }
         return result;
     }
