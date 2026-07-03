@@ -51,6 +51,13 @@ import org.bukkit.configuration.file.YamlConfiguration;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -114,18 +121,19 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         if (tickTask != null) tickTask.cancel();
         if (secondTask != null) secondTask.cancel();
 
+        // A play world is disposable. Never save it back into the editable source world.
+        // On the next enable, every registered arena receives a freshly cloned play world.
         for (Arena arena : arenas.values()) {
             removeJudge(arena);
-            for (PlayerState state : arena.players.values()) {
+            for (PlayerState state : new ArrayList<>(arena.players.values())) {
                 Player player = Bukkit.getPlayer(state.uuid);
-                if (player != null && player.isOnline()) {
-                    returnToSurvival(player, false);
-                }
+                if (player != null && player.isOnline()) returnToSurvival(player, false);
+                spectatorRejoinArena.remove(state.uuid);
             }
-            if (arena.world() != null) {
-                arena.world().setGameRule(GameRule.KEEP_INVENTORY, true);
-                arena.world().save();
-            }
+            arena.players.clear();
+            arena.phase = Phase.IDLE;
+            arena.currentBuild = null;
+            arena.judgedLoser = null;
         }
         saveState();
     }
@@ -310,10 +318,13 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             String key = validKey(args[1], "地图名称");
             Arena arena = requireArena(key);
             requireIdleForEditing(arena);
-            if (arena.world() == null) throw new IllegalArgumentException("竞技场世界当前未加载。");
-            arena.world().save();
+            World source = requireTemplateWorld(arena);
+            source.save();
+            if (arena.registered) {
+                refreshRegisteredPlayWorld(arena);
+            }
             saveState();
-            send(player, ChatColor.GREEN + "竞技场 " + key + " 已保存。");
+            send(player, ChatColor.GREEN + "竞技场 " + key + " 已保存" + (arena.registered ? "，运行地图已同步重建。" : "。"));
             return;
         }
         returnUsage(player, "/sb save template <地图名称> 或 /sb save <地图名称>");
@@ -339,7 +350,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         if (!isIsolatedBuildWorld(player.getWorld())) {
             throw new IllegalArgumentException("请在速建模板世界或竞技场编辑世界中执行该命令。");
         }
-        Arena current = arenaByWorld(player.getWorld());
+        Arena current = arenaByTemplateWorld(player.getWorld());
         if (current != null) requireIdleForEditing(current);
 
         int x1 = Integer.parseInt(args[1]);
@@ -506,14 +517,35 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         }
         Arena arena = requireArena(validKey(args[1], "地图名称"));
         requireIdleForEditing(arena);
+
         if (register) {
             String problem = arena.configurationProblem();
             if (problem != null) throw new IllegalArgumentException("无法注册：" + problem);
             if (builds.isEmpty()) throw new IllegalArgumentException("无法注册：建筑库为空。先使用 /sb addbuild 添加至少一个建筑。");
+
+            // Registration is the explicit snapshot point. Players will only ever enter <map>_play.
+            arena.phase = Phase.RECOVERING;
+            try {
+                rebuildPlayWorld(arena);
+                arena.registered = true;
+                send(sender, ChatColor.GREEN + "竞技场已注册：已从 " + arena.worldName + " 创建运行地图 " + arena.playWorldName() + "。" );
+            } catch (RuntimeException ex) {
+                arena.registered = false;
+                throw ex;
+            } finally {
+                arena.phase = Phase.IDLE;
+            }
+        } else {
+            arena.registered = false;
+            arena.phase = Phase.RECOVERING;
+            try {
+                discardPlayWorld(arena);
+                send(sender, ChatColor.YELLOW + "竞技场已取消注册，运行地图已删除。" );
+            } finally {
+                arena.phase = Phase.IDLE;
+            }
         }
-        arena.registered = register;
         saveState();
-        send(sender, register ? ChatColor.GREEN + "竞技场已注册，可供玩家加入。" : ChatColor.YELLOW + "竞技场已取消注册，玩家无法再加入。");
     }
 
     private void handleEdit(Player player, String[] args) {
@@ -523,7 +555,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         }
         Arena arena = requireArena(validKey(args[1], "地图名称"));
         requireIdleForEditing(arena);
-        World world = requireWorld(arena);
+        World world = requireTemplateWorld(arena);
         player.teleport(world.getSpawnLocation());
         player.setGameMode(GameMode.CREATIVE);
         disableFlight(player);
@@ -904,7 +936,6 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             }
         }
 
-        cleanupArenaBuildPlanes(arena);
         for (PlayerState state : new ArrayList<>(arena.players.values())) {
             Player player = Bukkit.getPlayer(state.uuid);
             if (player != null && player.isOnline()) returnToSurvival(player, true);
@@ -914,12 +945,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         arena.currentBuild = null;
         arena.judgedLoser = null;
         arena.round = 0;
-        World world = arena.world();
-        if (world != null) {
-            world.setGameRule(GameRule.KEEP_INVENTORY, true);
-            world.save();
-        }
-        arena.phase = Phase.IDLE;
+        restorePlayWorldAfterMatch(arena);
         saveState();
     }
 
@@ -928,7 +954,6 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         arena.phase = Phase.RECOVERING;
         removeJudge(arena);
         broadcast(arena, reason);
-        cleanupArenaBuildPlanes(arena);
         for (PlayerState state : new ArrayList<>(arena.players.values())) {
             Player player = Bukkit.getPlayer(state.uuid);
             if (player != null && player.isOnline()) returnToSurvival(player, true);
@@ -938,9 +963,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         arena.currentBuild = null;
         arena.judgedLoser = null;
         arena.round = 0;
-        World world = arena.world();
-        if (world != null) world.setGameRule(GameRule.KEEP_INVENTORY, true);
-        arena.phase = Phase.IDLE;
+        restorePlayWorldAfterMatch(arena);
         saveState();
     }
 
@@ -1080,7 +1103,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         Bounds2D bounds = arena.islands.get(state.slot);
         if (bounds == null) return;
         Location location = attempted == null ? player.getLocation() : attempted;
-        if (location.getWorld() == null || !location.getWorld().getName().equals(arena.worldName)) return;
+        if (location.getWorld() == null || !location.getWorld().getName().equals(arena.playWorldName())) return;
         if (bounds.contains(location.getX(), location.getZ())) return;
         Anchor anchor = arena.anchors.get(state.slot);
         if (anchor == null) return;
@@ -1625,6 +1648,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         }
     }
 
+    /** Creates or loads an editable template world. */
     private World createVoidWorld(String worldName) {
         World current = Bukkit.getWorld(worldName);
         if (current != null) return current;
@@ -1633,6 +1657,24 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         creator.generateStructures(false);
         World world = Bukkit.createWorld(creator);
         if (world == null) throw new IllegalArgumentException("创建世界失败：" + worldName);
+        configureIsolatedWorld(world);
+        return world;
+    }
+
+    /** Loads a copied runtime world. Its on-disk folder must already exist. */
+    private World loadPlayWorld(Arena arena) {
+        World current = arena.world();
+        if (current != null) return current;
+        WorldCreator creator = new WorldCreator(arena.playWorldName());
+        creator.generator(new VoidGenerator());
+        creator.generateStructures(false);
+        World world = Bukkit.createWorld(creator);
+        if (world == null) throw new IllegalArgumentException("无法加载运行地图：" + arena.playWorldName());
+        configureIsolatedWorld(world);
+        return world;
+    }
+
+    private void configureIsolatedWorld(World world) {
         world.setGameRule(GameRule.DO_MOB_SPAWNING, false);
         world.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, false);
         world.setGameRule(GameRule.DO_WEATHER_CYCLE, false);
@@ -1640,18 +1682,176 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         world.setTime(6000L);
         world.setStorm(false);
         world.setGameRule(GameRule.KEEP_INVENTORY, true);
-        return world;
     }
 
+    /**
+     * A registered arena owns two worlds: its editable source (arena.worldName) and its disposable
+     * runtime clone (arena.playWorldName()). A server/plugin restart resets all runtime clones.
+     */
     private void loadConfiguredWorlds() {
         for (String template : templates) createVoidWorld(templateWorldName(template));
-        for (Arena arena : arenas.values()) createVoidWorld(arena.worldName);
+        for (Arena arena : arenas.values()) {
+            createVoidWorld(arena.worldName);
+            if (!arena.registered) continue;
+            try {
+                rebuildPlayWorld(arena);
+            } catch (RuntimeException ex) {
+                arena.registered = false;
+                getLogger().log(Level.SEVERE, "无法重建竞技场运行地图 " + arena.name + "；已自动取消注册。", ex);
+            }
+        }
+        saveState();
     }
 
+    /** Runtime game methods call this; players never enter the editable source map. */
     private World requireWorld(Arena arena) {
         World world = arena.world();
+        if (world != null) return world;
+        if (!arena.registered) throw new IllegalArgumentException("竞技场未注册，运行地图不存在。请先执行 /sb register " + arena.name);
+        if (arena.phase.isGame()) throw new IllegalStateException("运行地图在比赛中意外卸载，已拒绝重建以防止覆盖本局进度。");
+        return rebuildPlayWorld(arena);
+    }
+
+    private World requireTemplateWorld(Arena arena) {
+        World world = arena.templateWorld();
         if (world == null) world = createVoidWorld(arena.worldName);
         return world;
+    }
+
+    private void refreshRegisteredPlayWorld(Arena arena) {
+        arena.phase = Phase.RECOVERING;
+        try {
+            rebuildPlayWorld(arena);
+        } finally {
+            arena.phase = Phase.IDLE;
+        }
+    }
+
+    /** Replaces the complete runtime world from the editable source map. Must run on the server thread. */
+    private World rebuildPlayWorld(Arena arena) {
+        World source = requireTemplateWorld(arena);
+        source.save();
+        Path sourceFolder = source.getWorldFolder().toPath();
+        Path targetFolder = Bukkit.getWorldContainer().toPath().resolve(arena.playWorldName());
+        Path stagingFolder = targetFolder.resolveSibling(arena.playWorldName() + ".sb-copying");
+
+        try {
+            deleteDirectory(stagingFolder);
+            copyWorldDirectory(sourceFolder, stagingFolder);
+            // Only replace the old clone after its fresh replacement has copied successfully.
+            discardPlayWorld(arena);
+            moveDirectory(stagingFolder, targetFolder);
+            World play = loadPlayWorld(arena);
+            play.setGameRule(GameRule.KEEP_INVENTORY, true);
+            return play;
+        } catch (IOException ex) {
+            try {
+                deleteDirectory(stagingFolder);
+            } catch (IOException cleanup) {
+                ex.addSuppressed(cleanup);
+            }
+            throw new IllegalArgumentException("复制竞技场运行地图失败：" + ex.getMessage(), ex);
+        }
+    }
+
+    /** Deletes only the disposable <map>_play world, never the editable source. */
+    private void discardPlayWorld(Arena arena) {
+        World play = arena.world();
+        Path folder = play != null
+                ? play.getWorldFolder().toPath()
+                : Bukkit.getWorldContainer().toPath().resolve(arena.playWorldName());
+        removeJudge(arena);
+        if (play != null) {
+            for (Player player : new ArrayList<>(play.getPlayers())) {
+                returnToSurvival(player, true);
+            }
+            if (!Bukkit.unloadWorld(play, false)) {
+                throw new IllegalArgumentException("无法卸载运行地图 " + arena.playWorldName() + "。请确认没有其他插件锁定该世界。");
+            }
+        }
+        try {
+            deleteDirectory(folder);
+        } catch (IOException ex) {
+            throw new IllegalArgumentException("无法删除旧运行地图 " + arena.playWorldName() + "：" + ex.getMessage(), ex);
+        }
+    }
+
+    private void restorePlayWorldAfterMatch(Arena arena) {
+        try {
+            if (arena.registered) rebuildPlayWorld(arena);
+            else discardPlayWorld(arena);
+            arena.phase = Phase.IDLE;
+        } catch (RuntimeException ex) {
+            // The immutable source is still intact. Disable joining rather than exposing a partial clone.
+            arena.registered = false;
+            arena.phase = Phase.IDLE;
+            getLogger().log(Level.SEVERE, "竞技场 " + arena.name + " 的运行地图恢复失败，已取消注册。源地图未受影响。", ex);
+        }
+    }
+
+    private void copyWorldDirectory(Path source, Path destination) throws IOException {
+        if (!Files.isDirectory(source)) throw new IOException("源世界目录不存在：" + source);
+        Files.walkFileTree(source, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                Path relative = source.relativize(dir);
+                if (skipWorldCopyPath(relative)) return FileVisitResult.SKIP_SUBTREE;
+                Files.createDirectories(destination.resolve(relative));
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Path relative = source.relativize(file);
+                if (!skipWorldCopyPath(relative)) {
+                    Files.copy(file, destination.resolve(relative), StandardCopyOption.COPY_ATTRIBUTES);
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    /**
+     * Paper's world-scoped runtime metadata contains the source world's identity. It must not be
+     * copied into <map>_play. The check also handles modern nested dimension folders such as
+     * dimensions/minecraft/<world>/data/paper/metadata.dat.
+     */
+    private boolean skipWorldCopyPath(Path relative) {
+        if (relative.getNameCount() == 0) return false;
+        String normalized = relative.toString().replace(File.separatorChar, '/');
+        String fileName = relative.getFileName().toString();
+        if (fileName.equals("uid.dat") || fileName.equals("session.lock")) return true;
+        if (normalized.equals("data/paper") || normalized.startsWith("data/paper/") || normalized.contains("/data/paper/")) return true;
+        // These belong to players, not to an arena template, and must not travel into a game clone.
+        return normalized.equals("playerdata") || normalized.startsWith("playerdata/")
+                || normalized.equals("stats") || normalized.startsWith("stats/")
+                || normalized.equals("advancements") || normalized.startsWith("advancements/");
+    }
+
+    private void deleteDirectory(Path directory) throws IOException {
+        if (!Files.exists(directory)) return;
+        Files.walkFileTree(directory, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Files.deleteIfExists(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException error) throws IOException {
+                if (error != null) throw error;
+                Files.deleteIfExists(dir);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    private void moveDirectory(Path source, Path destination) throws IOException {
+        try {
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(source, destination);
+        }
     }
 
     private Arena requireArena(String key) {
@@ -1661,8 +1861,8 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     }
 
     private Arena requireEditorArena(Player player) {
-        Arena arena = arenaByWorld(player.getWorld());
-        if (arena == null) throw new IllegalArgumentException("请站在需要编辑的竞技场世界内执行该命令。");
+        Arena arena = arenaByTemplateWorld(player.getWorld());
+        if (arena == null) throw new IllegalArgumentException("请站在需要编辑的原始竞技场世界内执行该命令。运行地图不能编辑。");
         requireIdleForEditing(arena);
         return arena;
     }
@@ -1673,7 +1873,17 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         }
     }
 
+    /** Finds an arena from either its editable source world or its runtime clone. */
     private Arena arenaByWorld(World world) {
+        if (world == null) return null;
+        String name = world.getName();
+        return arenas.values().stream()
+                .filter(arena -> arena.worldName.equals(name) || arena.playWorldName().equals(name))
+                .findFirst().orElse(null);
+    }
+
+    /** Finds an arena only from its editable source world. */
+    private Arena arenaByTemplateWorld(World world) {
         if (world == null) return null;
         return arenas.values().stream().filter(arena -> arena.worldName.equals(world.getName())).findFirst().orElse(null);
     }
@@ -1698,7 +1908,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     }
 
     private boolean isIsolatedBuildWorld(World world) {
-        return isTemplateWorld(world) || arenaByWorld(world) != null;
+        return isTemplateWorld(world) || arenaByTemplateWorld(world) != null;
     }
 
     private static Anchor anchorUnderPlayer(Player player) {
@@ -1973,6 +2183,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
 
     private static final class Arena {
         final String name;
+        /** Editable source map directory, persisted as "world" in state.yml for backward compatibility. */
         final String worldName;
         boolean registered;
         final Map<Integer, Point> spawns = new HashMap<>();
@@ -1997,8 +2208,17 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             this.worldName = worldName;
         }
 
-        World world() {
+        /** The disposable runtime map that players use: <source>_play. */
+        String playWorldName() {
+            return name + "_play";
+        }
+
+        World templateWorld() {
             return Bukkit.getWorld(worldName);
+        }
+
+        World world() {
+            return Bukkit.getWorld(playWorldName());
         }
 
         String configurationProblem() {
