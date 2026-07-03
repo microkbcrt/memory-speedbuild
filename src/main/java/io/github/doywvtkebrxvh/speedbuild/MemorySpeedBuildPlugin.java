@@ -91,17 +91,24 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     private static final int BUILD_RADIUS = 3;
     private static final int COUNTDOWN_SECONDS = 30;
     private static final int MEMORY_SECONDS = 15;
+    /** One controlled correction break every 0.30 seconds; prevents a held mouse button from clearing a row. */
+    private static final long CONTROLLED_BREAK_COOLDOWN_TICKS = 6L;
+    /** Keep the player's collision box just inside the configured island rectangle. */
+    private static final double BOUNDARY_INSET = 0.31D;
     private static final Random RANDOM = new Random();
 
     private final Map<String, Arena> arenas = new LinkedHashMap<>();
     private final Map<String, BuildData> builds = new LinkedHashMap<>();
     private final Set<String> templates = new LinkedHashSet<>();
     private final Map<UUID, String> spectatorRejoinArena = new HashMap<>();
+    /** Tick gate for controlled RESTORE breaking. It is intentionally not persisted. */
+    private final Map<UUID, Long> nextControlledBreakTick = new HashMap<>();
 
     private File stateFile;
     private Point survivalPoint;
     private BukkitTask tickTask;
     private BukkitTask secondTask;
+    private long serverTick;
 
     @Override
     public void onEnable() {
@@ -138,6 +145,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             arena.currentBuild = null;
             arena.judgedLoser = null;
         }
+        nextControlledBreakTick.clear();
         saveState();
     }
 
@@ -727,6 +735,14 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             state.alive = true;
             state.completed = false;
             state.score = 0;
+            Player player = Bukkit.getPlayer(state.uuid);
+            if (player != null && player.isOnline()) {
+                // This is the single gameplay-mode transition: the player enters
+                // SURVIVAL once at match start, then keeps the same mode through
+                // MEMORY, RESTORE and JUDGING so flight is never reset mid-round.
+                player.setGameMode(GameMode.SURVIVAL);
+                enableFlight(player);
+            }
         }
         broadcast(arena, ChatColor.GREEN + "比赛正式开始！");
         beginMemory(arena);
@@ -745,7 +761,8 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             // Move first: the source template may occupy the old centre location.
             if (player != null && player.isOnline()) {
                 clearInventory(player);
-                player.setGameMode(GameMode.SURVIVAL);
+                // Do not change game mode between gameplay phases: changing it
+                // resets client flight. Event protection handles build/break rules.
                 enableFlight(player);
                 clearJudgeCurse(player);
                 player.removePotionEffect(PotionEffectType.HASTE);
@@ -772,7 +789,6 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             if (player != null && player.isOnline()) {
                 clearInventory(player);
                 giveMaterials(player, arena.currentBuild);
-                player.setGameMode(GameMode.SURVIVAL);
                 enableFlight(player);
                 applyRestoreEffects(player);
                 title(player, ChatColor.GREEN + "复原阶段", ChatColor.WHITE + "开始搭建！", 25);
@@ -790,9 +806,10 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         if (player != null && player.isOnline()) {
             title(player, ChatColor.GOLD + "完美复原！", "", 40);
             player.playSound(player.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
-            player.setGameMode(GameMode.ADVENTURE);
+            // Keep SURVIVAL and current flight state. From here state.completed
+            // makes all placement/breaking events fail closed.
             player.removePotionEffect(PotionEffectType.HASTE);
-            disableFlight(player);
+            enableFlight(player);
         }
         broadcast(arena, ChatColor.YELLOW + state.name + " 在 " + spent + " 秒内还原了建筑！");
         playToArena(arena, Sound.BLOCK_ANVIL_LAND, 0.7f, 1.3f);
@@ -809,7 +826,6 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         for (PlayerState state : activeStates(arena)) {
             Player player = Bukkit.getPlayer(state.uuid);
             if (player != null && player.isOnline()) {
-                player.setGameMode(GameMode.SURVIVAL);
                 enableFlight(player);
                 title(player, ChatColor.GREEN + "审视者对你印象不错", "", 60);
                 player.playSound(player.getLocation(), Sound.BLOCK_ANVIL_LAND, 0.8f, 1.2f);
@@ -834,7 +850,6 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             state.score = score(arena, state.slot, arena.currentBuild);
             Player player = Bukkit.getPlayer(state.uuid);
             if (player != null && player.isOnline()) {
-                player.setGameMode(GameMode.SURVIVAL);
                 enableFlight(player);
                 player.removePotionEffect(PotionEffectType.HASTE);
                 clearJudgeCurse(player);
@@ -1016,6 +1031,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     }
 
     private void returnToSurvival(Player player, boolean clear) {
+        nextControlledBreakTick.remove(player.getUniqueId());
         if (clear) clearInventory(player);
         clearJudgeCurse(player);
         player.removePotionEffect(PotionEffectType.HASTE);
@@ -1038,31 +1054,37 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     // -------------------------------------------------------------------------
 
     private void gameTick() {
+        serverTick++;
         for (Arena arena : arenas.values()) {
+            // Waiting players are bound too. The only phase that deliberately
+            // releases the runtime world is RECOVERING.
+            if (arena.phase != Phase.RECOVERING) {
+                for (PlayerState state : arena.players.values()) {
+                    if (!state.alive) continue;
+                    Player player = Bukkit.getPlayer(state.uuid);
+                    if (player == null || !player.isOnline()) continue;
+                    enforceIslandBounds(arena, state, player, player.getLocation());
+                    if (arena.phase.isGame()) enableFlight(player);
+                }
+            }
+
             if (arena.phase == Phase.MEMORY) {
                 for (PlayerState state : activeStates(arena)) {
                     Player player = Bukkit.getPlayer(state.uuid);
-                    if (player != null && player.isOnline()) {
-                        enforceIslandBounds(arena, state, player, null);
-                        if (!matchesBuild(arena, state.slot, arena.currentBuild)) pasteBuild(arena, state.slot, arena.currentBuild);
+                    if (player != null && player.isOnline() && !matchesBuild(arena, state.slot, arena.currentBuild)) {
+                        // In MEMORY the model is authoritative; any attempted
+                        // client/world mutation is overwritten on the next tick.
+                        pasteBuild(arena, state.slot, arena.currentBuild);
                     }
                 }
             } else if (arena.phase == Phase.RESTORE) {
                 for (PlayerState state : activeStates(arena)) {
                     Player player = Bukkit.getPlayer(state.uuid);
-                    if (player != null && player.isOnline()) {
-                        enforceIslandBounds(arena, state, player, null);
-                        if (!state.completed) {
-                            applyRestoreEffects(player);
-                            replenishRestoreMaterials(arena, state, player, arena.currentBuild);
-                            if (matchesBuild(arena, state.slot, arena.currentBuild)) playerCompleted(arena, state);
-                        }
+                    if (player != null && player.isOnline() && !state.completed) {
+                        applyRestoreEffects(player);
+                        replenishRestoreMaterials(arena, state, player, arena.currentBuild);
+                        if (matchesBuild(arena, state.slot, arena.currentBuild)) playerCompleted(arena, state);
                     }
-                }
-            } else if (arena.phase == Phase.JUDGING) {
-                for (PlayerState state : activeStates(arena)) {
-                    Player player = Bukkit.getPlayer(state.uuid);
-                    if (player != null && player.isOnline()) enforceIslandBounds(arena, state, player, null);
                 }
             }
         }
@@ -1116,17 +1138,35 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         }, ticks);
     }
 
-    private void enforceIslandBounds(Arena arena, PlayerState state, Player player, Location attempted) {
+    /**
+     * Returns the nearest legal point inside the island rectangle, preserving
+     * height, yaw and pitch. Unlike the old implementation this never sends a
+     * player back to the island centre merely for touching one boundary.
+     */
+    private Location nearestLegalIslandLocation(Arena arena, PlayerState state, Location attempted) {
         Bounds2D bounds = arena.islands.get(state.slot);
-        if (bounds == null) return;
-        Location location = attempted == null ? player.getLocation() : attempted;
-        if (location.getWorld() == null || !location.getWorld().getName().equals(arena.playWorldName())) return;
-        if (bounds.contains(location.getX(), location.getZ())) return;
-        Anchor anchor = arena.anchors.get(state.slot);
-        if (anchor == null) return;
-        World world = requireWorld(arena);
-        player.teleport(new Location(world, anchor.x + 0.5, anchor.y + 1.0, anchor.z + 0.5, player.getLocation().getYaw(), player.getLocation().getPitch()));
-        send(player, ChatColor.RED + "不能离开自己的岛屿范围。");
+        if (bounds == null || attempted == null) return null;
+        World runtime = arena.world();
+        if (runtime == null || attempted.getWorld() != runtime) return null;
+        if (bounds.contains(attempted.getX(), attempted.getZ())) return null;
+
+        double minX = bounds.minX + BOUNDARY_INSET;
+        double maxX = bounds.maxX + 1.0D - BOUNDARY_INSET;
+        double minZ = bounds.minZ + BOUNDARY_INSET;
+        double maxZ = bounds.maxZ + 1.0D - BOUNDARY_INSET;
+        Location corrected = attempted.clone();
+        corrected.setX(clamp(attempted.getX(), minX, maxX));
+        corrected.setZ(clamp(attempted.getZ(), minZ, maxZ));
+        return corrected;
+    }
+
+    private void enforceIslandBounds(Arena arena, PlayerState state, Player player, Location attempted) {
+        Location corrected = nearestLegalIslandLocation(arena, state, attempted);
+        if (corrected != null) player.teleport(corrected);
+    }
+
+    private static double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     private int restoreSeconds(int round) {
@@ -1277,9 +1317,12 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         return bounds.contains(centerX - 1, centerZ - 1) && bounds.contains(centerX + 1, centerZ + 1);
     }
 
-    /** Haste 255 is intentionally refreshed during RESTORE for immediate correction breaks. */
+    /**
+     * The visible Haste effect gives fast feedback, but actual correction breaks
+     * are rate-limited by onBlockDamage so a held button cannot delete a row.
+     */
     private void applyRestoreEffects(Player player) {
-        player.addPotionEffect(new PotionEffect(PotionEffectType.HASTE, 40, 255, true, false, false), true);
+        player.addPotionEffect(new PotionEffect(PotionEffectType.HASTE, 40, 4, true, false, false), true);
     }
 
     /**
@@ -1319,7 +1362,9 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         if (anchor == null) return result;
         World world = requireWorld(arena);
         int fromY = Math.max(world.getMinHeight(), anchor.y + 1);
-        int toY = Math.min(world.getMaxHeight(), fromY + Math.max(1, build.height));
+        // Count the entire editable 7×7 vertical column. A mistaken tracked
+        // block placed above the intended model must still consume material.
+        int toY = world.getMaxHeight();
         for (int y = fromY; y < toY; y++) {
             for (int x = anchor.x - BUILD_RADIUS; x <= anchor.x + BUILD_RADIUS; x++) {
                 for (int z = anchor.z - BUILD_RADIUS; z <= anchor.z + BUILD_RADIUS; z++) {
@@ -1457,31 +1502,57 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     public void onBlockPlace(BlockPlaceEvent event) {
         Arena arena = arenaOf(event.getPlayer().getUniqueId());
         if (arena == null) return;
-        if (!canModify(arena, event.getPlayer(), event.getBlockPlaced().getX(), event.getBlockPlaced().getZ())) event.setCancelled(true);
+        // Only an alive, unfinished player may place inside their own 7×7
+        // build column during RESTORE. Everything else fails closed.
+        if (!canModify(arena, event.getPlayer(), event.getBlockPlaced())) event.setCancelled(true);
     }
 
     /**
-     * Haste alone still goes through vanilla hardness/tool checks, so blocks such
-     * as iron blocks and obsidian remain slow. During RESTORE, tell the server to
-     * break the first damaged block instantly. The normal BlockBreakEvent then
-     * runs immediately and the per-tick material reconciler restores the item if
-     * vanilla did not drop it because the held tool was unsuitable.
+     * Vanilla instant break chains while the mouse is held. Instead, cancel the
+     * vanilla damage operation and delete exactly one legal build-column block
+     * after one server tick, with a short per-player cooldown. This creates no
+     * dropped item and keeps obsidian/iron correction responsive but controlled.
      */
-    @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onBlockDamage(BlockDamageEvent event) {
         Player player = event.getPlayer();
         Arena arena = arenaOf(player.getUniqueId());
         if (arena == null) return;
+
         Block block = event.getBlock();
-        if (!canModify(arena, player, block.getX(), block.getZ())) return;
-        if (!block.getType().isAir()) event.setInstaBreak(true);
+        if (!canModify(arena, player, block)) {
+            event.setCancelled(true);
+            return;
+        }
+        event.setCancelled(true);
+        if (block.getType().isAir()) return;
+
+        long next = nextControlledBreakTick.getOrDefault(player.getUniqueId(), 0L);
+        if (serverTick < next) return;
+        nextControlledBreakTick.put(player.getUniqueId(), serverTick + CONTROLLED_BREAK_COOLDOWN_TICKS);
+        Location location = block.getLocation();
+        Bukkit.getScheduler().runTaskLater(this, () -> controlledRestoreBreak(arena, player.getUniqueId(), location), 1L);
     }
 
-    @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
+    private void controlledRestoreBreak(Arena arena, UUID playerId, Location location) {
+        Player player = Bukkit.getPlayer(playerId);
+        if (player == null || !player.isOnline() || location.getWorld() == null) return;
+        Block block = location.getBlock();
+        if (!canModify(arena, player, block) || block.getType().isAir()) return;
+        // Direct mutation deliberately bypasses BlockBreakEvent/drop generation.
+        // The per-tick material reconciler restores the relevant template item.
+        block.setType(Material.AIR, false);
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onBlockBreak(BlockBreakEvent event) {
         Arena arena = arenaOf(event.getPlayer().getUniqueId());
         if (arena == null) return;
-        if (!canModify(arena, event.getPlayer(), event.getBlock().getX(), event.getBlock().getZ())) event.setCancelled(true);
+        // Direct/creative/other-plugin break paths are never allowed. RESTORE
+        // uses controlledRestoreBreak above, which has no drops.
+        event.setDropItems(false);
+        event.setExpToDrop(0);
+        event.setCancelled(true);
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -1517,9 +1588,13 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     @EventHandler(ignoreCancelled = true)
     public void onMove(PlayerMoveEvent event) {
         Arena arena = arenaOf(event.getPlayer().getUniqueId());
-        if (arena == null || !arena.phase.isGame() || event.getTo() == null) return;
+        if (arena == null || arena.phase == Phase.RECOVERING || event.getTo() == null) return;
         PlayerState state = arena.players.get(event.getPlayer().getUniqueId());
-        if (state != null && state.alive) enforceIslandBounds(arena, state, event.getPlayer(), event.getTo());
+        if (state == null || !state.alive) return;
+        // During IDLE and COUNTDOWN this prevents lobby players from leaving
+        // their assigned island as well. setTo avoids a visible centre teleport.
+        Location corrected = nearestLegalIslandLocation(arena, state, event.getTo());
+        if (corrected != null) event.setTo(corrected);
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -1563,6 +1638,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
+        nextControlledBreakTick.remove(player.getUniqueId());
         Arena arena = arenaOf(player.getUniqueId());
         if (arena == null) return;
         PlayerState state = arena.players.get(player.getUniqueId());
@@ -1594,14 +1670,28 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         Bukkit.getScheduler().runTask(this, () -> moveToSpectator(arena, event.getPlayer()));
     }
 
-    private boolean canModify(Arena arena, Player player, int x, int z) {
-        if (arena.phase != Phase.RESTORE) return false;
+    /**
+     * RESTORE is the only editable phase. "Editable" means the player's own
+     * 7×7 column above the configured base plane; the island platform, borders,
+     * other islands and the base layer can never be modified.
+     */
+    private boolean canModify(Arena arena, Player player, Block block) {
+        if (arena.phase != Phase.RESTORE || block == null) return false;
         World runtime = arena.world();
-        if (runtime == null || player.getWorld() != runtime) return false;
+        if (runtime == null || player.getWorld() != runtime || block.getWorld() != runtime) return false;
         PlayerState state = arena.players.get(player.getUniqueId());
         if (state == null || !state.alive || state.completed) return false;
-        Bounds2D bounds = arena.islands.get(state.slot);
-        return bounds != null && bounds.contains(x + 0.5, z + 0.5);
+        return isOwnEditableBuildColumn(arena, state.slot, block.getX(), block.getY(), block.getZ());
+    }
+
+    private boolean isOwnEditableBuildColumn(Arena arena, int slot, int x, int y, int z) {
+        Anchor anchor = arena.anchors.get(slot);
+        Bounds2D island = arena.islands.get(slot);
+        if (anchor == null || island == null) return false;
+        if (!island.contains(x + 0.5D, z + 0.5D)) return false;
+        return x >= anchor.x - BUILD_RADIUS && x <= anchor.x + BUILD_RADIUS
+                && z >= anchor.z - BUILD_RADIUS && z <= anchor.z + BUILD_RADIUS
+                && y >= anchor.y + 1;
     }
 
     // -------------------------------------------------------------------------
@@ -1659,9 +1749,9 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         return slots.isEmpty() ? -1 : slots.get(RANDOM.nextInt(slots.size()));
     }
 
+    /** Keep flying permission without resetting an already-flying player. */
     private void enableFlight(Player player) {
-        player.setAllowFlight(true);
-        player.setFlying(false);
+        if (!player.getAllowFlight()) player.setAllowFlight(true);
     }
 
     private void disableFlight(Player player) {
