@@ -1,0 +1,18 @@
+name: MemorySpeedBuild
+version: ${project.version}
+main: io.github.doywvtkebrxvh.speedbuild.MemorySpeedBuildPlugin
+api-version: '26.2'
+description: Small standalone memory speed-build game for Paper 26.2.
+author: doywvtkebrxvh
+load: POSTWORLD
+commands:
+  sb:
+    description: MemorySpeedBuild player and administrator command.
+    usage: /sb help
+  sbforce:
+    description: Force start or stop an arena.
+    usage: /sbforce <start|stop>
+permissions:
+  speedbuild.admin:
+    description: Configure, register, edit, force start, and force stop MemorySpeedBuild arenas.
+    default: op
