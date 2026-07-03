@@ -50,6 +50,7 @@ import org.bukkit.configuration.file.YamlConfiguration;
 
 import java.io.File;
 import java.io.IOException;
+import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -347,7 +348,10 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         int x2 = Integer.parseInt(args[4]);
         int y2 = Integer.parseInt(args[5]);
         int z2 = Integer.parseInt(args[6]);
-        String key = validKey(args[7], "建筑名称");
+        // 建筑显示名称允许中文；内部键会做 Unicode NFC 规范化和英文大小写折叠，
+        // 所以“我的小屋”可直接用于 addbuild / delbuild / 侧边栏主题显示。
+        String name = validBuildName(args[7]);
+        String key = buildKey(name);
         int difficulty = Integer.parseInt(args[8]);
         if (difficulty < 1 || difficulty > 3) throw new IllegalArgumentException("难度只能是 1、2 或 3。");
 
@@ -364,13 +368,13 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             throw new IllegalArgumentException("Y 坐标超出当前世界范围。");
         }
 
-        BuildData build = captureBuild(player.getWorld(), key, difficulty, minX, minY, minZ, maxY);
+        BuildData build = captureBuild(player.getWorld(), name, difficulty, minX, minY, minZ, maxY);
         builds.put(key, build);
         saveState();
         send(player, ChatColor.GREEN + "已保存建筑 " + ChatColor.AQUA + build.name + ChatColor.GREEN + "，难度 " + difficulty + "，高度 " + build.height + "，方块数 " + build.blocks.size() + "。");
     }
 
-    private BuildData captureBuild(World world, String key, int difficulty, int minX, int minY, int minZ, int maxY) {
+    private BuildData captureBuild(World world, String name, int difficulty, int minX, int minY, int minZ, int maxY) {
         List<BlockSnapshot> snapshots = new ArrayList<>();
         Set<Material> unsupported = new LinkedHashSet<>();
         for (int y = minY; y <= maxY; y++) {
@@ -389,7 +393,7 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         if (!unsupported.isEmpty()) {
             throw new IllegalArgumentException("选区包含不能直接以同种物品发放的方块：" + unsupported + "。请使用普通可放置方块。");
         }
-        return new BuildData(key, difficulty, maxY - minY + 1, snapshots);
+        return new BuildData(name, difficulty, maxY - minY + 1, snapshots);
     }
 
     private void handleDelBuild(CommandSender sender, String[] args) {
@@ -397,10 +401,12 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             usage(sender, "/sb delbuild <name>");
             return;
         }
-        String key = validKey(args[1], "建筑名称");
-        if (builds.remove(key) == null) throw new IllegalArgumentException("不存在名为 " + key + " 的建筑。");
+        String requestedName = validBuildName(args[1]);
+        String key = buildKey(requestedName);
+        BuildData removed = builds.remove(key);
+        if (removed == null) throw new IllegalArgumentException("不存在名为 " + requestedName + " 的建筑。");
         saveState();
-        send(sender, ChatColor.GREEN + "已删除建筑 " + key + "。");
+        send(sender, ChatColor.GREEN + "已删除建筑 " + removed.name + "。");
     }
 
     private void handleListBuild(CommandSender sender) {
@@ -1537,12 +1543,36 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
         return value;
     }
 
+    /**
+     * 仅用于地图/模板的内部世界键。世界目录名保持 ASCII，避免不同文件系统与服务端工具
+     * 对 Unicode 世界名的兼容性问题。
+     */
     private static String validKey(String raw, String label) {
         String key = raw.toLowerCase(Locale.ROOT);
         if (!key.matches("[a-z0-9_-]{1,32}")) {
             throw new IllegalArgumentException(label + "只能使用 1-32 个小写字母、数字、下划线或连字符。");
         }
         return key;
+    }
+
+    /**
+     * 建筑名称是面对玩家展示的主题名，允许中文。命令参数本身不含空格，因此名称也不允许空格。
+     * NFC 规范化避免同一中文/拉丁组合字符出现多个看似相同但实际不同的名称。
+     */
+    private static String validBuildName(String raw) {
+        String name = Normalizer.normalize(raw, Normalizer.Form.NFC).trim();
+        int length = name.codePointCount(0, name.length());
+        if (length < 1 || length > 32 || !name.matches("[\\p{IsHan}\\p{IsLatin}\\p{Nd}_-]+")) {
+            throw new IllegalArgumentException("建筑名称只能使用 1-32 个中文、字母、数字、下划线或连字符，且不能包含空格。");
+        }
+        return name;
+    }
+
+    /**
+     * 内部匹配键：中文保持原样，英文字母不区分大小写。
+     */
+    private static String buildKey(String name) {
+        return Normalizer.normalize(name, Normalizer.Form.NFC).toLowerCase(Locale.ROOT);
     }
 
     private static String templateWorldName(String key) {
@@ -1649,7 +1679,18 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
                     } catch (NumberFormatException ignored) { }
                 }
                 if (!snapshots.isEmpty()) {
-                    builds.put(key, new BuildData(section.getString("name", key), section.getInt("difficulty", 1), section.getInt("height", 1), snapshots));
+                    String storedName = section.getString("name", key);
+                    try {
+                        String displayName = validBuildName(storedName);
+                        String canonicalKey = buildKey(displayName);
+                        if (builds.containsKey(canonicalKey)) {
+                            getLogger().warning("state.yml 中存在重复建筑名称，已跳过后面的条目：" + displayName);
+                            continue;
+                        }
+                        builds.put(canonicalKey, new BuildData(displayName, section.getInt("difficulty", 1), section.getInt("height", 1), snapshots));
+                    } catch (IllegalArgumentException ex) {
+                        getLogger().warning("state.yml 中建筑名称无效，已跳过：" + storedName);
+                    }
                 }
             }
         }
@@ -1760,7 +1801,9 @@ public final class MemorySpeedBuildPlugin extends JavaPlugin implements Listener
             return filter(args[1], choices);
         }
         if (root.equals("save") && args.length == 3 && args[1].equalsIgnoreCase("template")) return filter(args[2], new ArrayList<>(templates));
-        if ((root.equals("delbuild")) && args.length == 2) return filter(args[1], new ArrayList<>(builds.keySet()));
+        if (root.equals("delbuild") && args.length == 2) {
+            return filter(args[1], builds.values().stream().map(build -> build.name).toList());
+        }
         if (root.equals("add") && args.length == 2) return filter(args[1], List.of("setspawn", "centre", "deathspawn"));
         if (root.equals("del") && args.length == 2) return filter(args[1], List.of("setspawn"));
         return List.of();
